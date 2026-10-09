@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float)
     p.add_argument("--lora", action="store_true")
+    p.add_argument("--min-pairs", type=int, default=50)
     p.add_argument("--pairs-only", action="store_true", help="just write the training pairs as JSONL")
 
     a = ap.parse_args(argv)
@@ -121,7 +122,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"wrote {len(pairs)} pairs to {a.output}", file=sys.stderr)
         else:
             show(finetune.train(root(a.path), a.output, epochs=a.epochs, batch_size=a.batch_size,
-                                lr=a.lr, lora=a.lora))
+                                lr=a.lr, lora=a.lora, min_pairs=a.min_pairs))
 
 
 if __name__ == "__main__":

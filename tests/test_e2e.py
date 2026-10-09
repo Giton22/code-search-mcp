@@ -347,3 +347,14 @@ def test_mcp_stdio(repo, env):
         assert "src/auth/keys.py" in res["result"]["content"][0]["text"]
     finally:
         p.kill()
+
+
+def test_prompts_keep_whitespace(monkeypatch):
+    monkeypatch.setenv("CODE_EMBED_BACKEND", "st")
+    from code_search import config, embed
+
+    cfg = config.reload()
+    e = embed.Embedder(cfg)
+    assert e.query_text("find f") == "task: code retrieval | query: find f"
+    assert e.doc_text("a.py f", "x") == "title: a.py f | text: x"
+    assert e.doc_text("", "x") == "title: none | text: x"

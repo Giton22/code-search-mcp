@@ -30,8 +30,9 @@ class Config:
     batch: int = field(default_factory=lambda: int(_env("CODE_EMBED_BATCH", "32")))
 
     # prompts from the EmbeddingGemma 2 model card (code retrieval task)
-    query_prefix: str = field(default_factory=lambda: _env("CODE_EMBED_QUERY_PREFIX", "task: code retrieval | query: "))
-    doc_template: str = field(default_factory=lambda: _env("CODE_EMBED_DOC_TEMPLATE", "title: {title} | text: {text}"))
+    # (read raw, not stripped: the trailing space in the prefix matters)
+    query_prefix: str = field(default_factory=lambda: os.environ.get("CODE_EMBED_QUERY_PREFIX", "task: code retrieval | query: "))
+    doc_template: str = field(default_factory=lambda: os.environ.get("CODE_EMBED_DOC_TEMPLATE", "title: {title} | text: {text}"))
 
     # optional cross-encoder reranker, e.g. "BAAI/bge-reranker-v2-m3"
     rerank_model: str = field(default_factory=lambda: _env("CODE_EMBED_RERANK"))

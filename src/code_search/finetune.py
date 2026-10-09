@@ -41,7 +41,8 @@ def _doc_pair(text: str) -> tuple[str, str] | None:
         if not m:
             return None
         doc = m.group(2)
-        code = text[: m.start(1)] + text[m.end():]
+        before, after = text[: m.start(1)].rstrip(" \t"), text[m.end():]
+        code = before + (after[1:] if after.startswith("\n") and before.endswith("\n") else after)
     doc = _clean(doc)
     if len(doc.split()) < 4 or len(code.strip().splitlines()) < 3:
         return None
@@ -82,7 +83,7 @@ def build_pairs(root: Path) -> list[dict]:
 
 
 def train(root: Path, output: Path, epochs: int = 1, batch_size: int = 64, lr: float | None = None,
-          lora: bool = False, max_pairs: int = 20000, seed: int = 0) -> dict:
+          lora: bool = False, max_pairs: int = 20000, seed: int = 0, min_pairs: int = 50) -> dict:
     import torch
     from datasets import Dataset
     from sentence_transformers import (SentenceTransformer, SentenceTransformerTrainer,
@@ -93,12 +94,13 @@ def train(root: Path, output: Path, epochs: int = 1, batch_size: int = 64, lr: f
 
     cfg = config.CFG
     pairs = build_pairs(root)
-    if len(pairs) < 50:
-        raise SystemExit(f"Only {len(pairs)} training pairs found; need at least ~50 (more docstrings/commits).")
+    if len(pairs) < min_pairs:
+        raise SystemExit(f"Only {len(pairs)} training pairs found; need at least {min_pairs} "
+                         "(more docstrings / descriptive commits), or lower --min-pairs.")
     rng = random.Random(seed)
     rng.shuffle(pairs)
     pairs = pairs[:max_pairs]
-    n_eval = max(20, len(pairs) // 10)
+    n_eval = max(min(20, len(pairs) // 3), len(pairs) // 10)
     eval_pairs, train_pairs = pairs[:n_eval], pairs[n_eval:]
     print(f"{len(train_pairs)} training pairs, {len(eval_pairs)} held out "
           f"({sum(p['src'] == 'doc' for p in pairs)} from docstrings, {sum(p['src'] == 'commit' for p in pairs)} from commits)")
@@ -115,9 +117,11 @@ def train(root: Path, output: Path, epochs: int = 1, batch_size: int = 64, lr: f
     if lora:
         from peft import LoraConfig, TaskType
 
+        gemma = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        names = {n.rsplit(".", 1)[-1] for n, _ in model.named_modules()}
+        targets = [t for t in gemma if t in names] or "all-linear"  # Unsloth's recipe for Gemma; fallback otherwise
         model.add_adapter(LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.0,
-                                     target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                                                     "gate_proj", "up_proj", "down_proj"]))
+                                     target_modules=targets))
 
     # held-out retrieval eval: queries vs every positive in the dataset as corpus
     corpus = {str(i): positive(p) for i, p in enumerate(pairs)}
@@ -142,6 +146,8 @@ def train(root: Path, output: Path, epochs: int = 1, batch_size: int = 64, lr: f
     SentenceTransformerTrainer(model=model, args=args, train_dataset=ds, loss=loss).train()
     after = evaluator(model)
     output.mkdir(parents=True, exist_ok=True)
+    # with --lora this saves a small adapter that references the base model; sentence-transformers
+    # applies it automatically when CODE_EMBED_MODEL points at this folder
     model.save_pretrained(str(output))
     key = next((k for k in after if k.endswith("mrr@10")), None)
     summary = {"output": str(output), "pairs": len(pairs),
