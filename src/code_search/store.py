@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 
 from . import config
+from . import graph
+from .filelock import FileLock
 
 SCHEMA_VERSION = "2"
 
@@ -38,6 +40,12 @@ CREATE TABLE IF NOT EXISTS commits(
     sha TEXT PRIMARY KEY, ts INTEGER, author TEXT, subject TEXT, body TEXT,
     files TEXT, symbols TEXT, vec BLOB);
 CREATE INDEX IF NOT EXISTS commits_ts ON commits(ts);
+CREATE TABLE IF NOT EXISTS refs(chunk INTEGER, name TEXT);
+CREATE INDEX IF NOT EXISTS refs_name ON refs(name);
+CREATE INDEX IF NOT EXISTS refs_chunk ON refs(chunk);
+CREATE TABLE IF NOT EXISTS defs(name TEXT, chunk INTEGER);
+CREATE INDEX IF NOT EXISTS defs_name ON defs(name);
+CREATE INDEX IF NOT EXISTS defs_chunk ON defs(chunk);
 """
 
 _FTS = [
@@ -86,7 +94,9 @@ class Store:
             con.close()
 
     def _init(self):
-        with self.connect() as con:
+        # one process at a time: switching to WAL and creating the schema can fail with
+        # "database is locked" when several servers open a new database together
+        with FileLock(self.path.with_suffix(".init.lock"), timeout=120), self.connect() as con:
             con.execute("PRAGMA journal_mode=WAL")
             con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
             ver = con.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
@@ -97,12 +107,15 @@ class Store:
                         " AND name NOT LIKE '%fts_%'").fetchall():
                     con.execute(f"DROP TABLE IF EXISTS {name}")
                 con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+                self.set_meta(con, "graph", graph.GRAPH_VERSION)  # empty, and filled as chunks arrive
             con.executescript(_SCHEMA)
             fts = True
             for stmt in _FTS:
                 try:
                     con.execute(stmt)
-                except sqlite3.OperationalError:
+                except sqlite3.OperationalError as e:
+                    if "no such module" not in str(e):  # only a SQLite built without FTS5 is expected
+                        raise
                     fts = False
             self.fts = fts
             self.set_meta(con, "schema", SCHEMA_VERSION)
@@ -124,6 +137,8 @@ class Store:
 
     # ---------------------------------------------------------------- chunks
     def delete_file(self, con, path: str):
+        con.execute("DELETE FROM refs WHERE chunk IN (SELECT id FROM chunks WHERE path=?)", (path,))
+        con.execute("DELETE FROM defs WHERE chunk IN (SELECT id FROM chunks WHERE path=?)", (path,))
         if self.fts:
             con.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text, symbol, path) "
                         "SELECT 'delete', id, text, symbol, path FROM chunks WHERE path=?", (path,))
@@ -136,7 +151,14 @@ class Store:
         if self.fts:
             con.execute("INSERT INTO chunks_fts(rowid, text, symbol, path) VALUES(?,?,?,?)",
                         (cur.lastrowid, c.text, c.symbol, path))
+        graph.index_chunk(con, cur.lastrowid, c.symbol, c.kind, c.text)
         return cur.lastrowid
+
+    def ensure_graph(self, con) -> None:
+        """Fill the symbol graph for an index built before it existed (from stored text, no re-embedding)."""
+        if self.get_meta(con, "graph") != graph.GRAPH_VERSION:
+            graph.rebuild(con)
+            self.set_meta(con, "graph", graph.GRAPH_VERSION)
 
     def cached_vectors(self, con, hashes: list[str]) -> dict[str, np.ndarray]:
         out: dict[str, np.ndarray] = {}

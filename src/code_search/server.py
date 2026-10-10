@@ -1,9 +1,13 @@
 """MCP server exposing code search tools over stdio."""
 from __future__ import annotations
 
+import functools
+import inspect
+import os
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from mcp.types import ToolAnnotations
 
@@ -12,7 +16,7 @@ try:  # mcp >= 2.0
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server
 
-from . import config, embed, history, indexer, search
+from . import config, context, daemon, embed, graph, history, indexer, search
 from .store import Store, all_stores
 from .watcher import WATCHERS
 
@@ -22,7 +26,10 @@ FIRST_INDEX_WAIT = 40.0  # seconds a tool waits for a first index before answeri
 INSTRUCTIONS = """\
 Local semantic code search (EmbeddingGemma 2) over the user's repos; nothing leaves the machine.
 Prefer these tools over grep/find when you don't know where something lives:
+- prepare_context: best first call for a task: the relevant code, its callers/callees, tests and commits in
+  one answer within a token budget. expand(handle) then shows the full code of anything it mentions.
 - search_code: find code by meaning or by symbol name. Omit `path` to use the current project.
+- find_definition / find_references: where a symbol is defined, and every place that uses it.
 - related_files: before editing a file, see what usually changes with it (callers, tests, configs).
 - find_tests: tests covering a file or symbol. find_similar: duplicates / patterns to follow.
 - search_history: why/when something changed. explain_area: map of an unfamiliar repo.
@@ -100,10 +107,44 @@ def _with_note(body: str, note: str) -> str:
     return f"{note}\n\n{body}" if note else body
 
 
+# ---------------------------------------------------------------- dispatch
+
+TOOLS: dict[str, Callable] = {}  # every tool body by name; the daemon runs these for thin clients
+
+
+def tool(fn: Callable) -> Callable:
+    """Register an MCP tool whose body runs in the shared daemon when there is one, in-process otherwise."""
+    TOOLS[fn.__name__] = fn
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def proxy(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return dispatch(fn.__name__, dict(bound.arguments))
+
+    mcp.tool(annotations=READ_ONLY)(proxy)
+    return fn
+
+
+def dispatch(name: str, args: dict):
+    # resolve client-side what depends on the client: its project folder and relative file paths
+    if "path" in args and not args["path"]:
+        args["path"] = str(indexer.resolve_root(None))
+    if args.get("image_path"):
+        args["image_path"] = str(Path(args["image_path"]).expanduser().resolve())
+    if daemon.enabled():
+        try:
+            return daemon.call(name, args)
+        except ConnectionError as e:
+            indexer.log(f"daemon unavailable ({e}); running in this process")
+    return TOOLS[name](**args)
+
+
 # ---------------------------------------------------------------- tools
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def search_code(query: str, path: str | None = None, repos: list[str] | None = None, k: int = 8,
                 path_glob: str | None = None, kinds: list[str] | None = None,
                 include_tests: bool = True, snippet_lines: int = 25) -> str:
@@ -126,7 +167,7 @@ def search_code(query: str, path: str | None = None, repos: list[str] | None = N
     return _with_note(search.format_hits(hits, snippet_lines, multi=len(stores) > 1), note)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def search_by_image(image_path: str, path: str | None = None, repos: list[str] | None = None, k: int = 6) -> str:
     """Find code related to a screenshot, mockup or diagram (EmbeddingGemma 2 puts images and code in the
     same space). `image_path` is a local file. Works best with CODE_EMBED_IMAGES=1 so repo images are indexed too."""
@@ -142,7 +183,7 @@ def search_by_image(image_path: str, path: str | None = None, repos: list[str] |
     return _with_note(search.format_hits(hits, 20, multi=len(stores) > 1), note)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def find_similar(file: str, line: int, path: str | None = None, k: int = 6, other_files_only: bool = False) -> str:
     """Code similar to the chunk at file:line — spot duplicated logic or find an existing pattern to follow
     before writing a new helper. `file` is relative to the repo root."""
@@ -153,7 +194,7 @@ def find_similar(file: str, line: int, path: str | None = None, k: int = 6, othe
     return _with_note(search.format_hits(hits, 20), note)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def related_files(file: str, path: str | None = None, k: int = 10) -> str:
     """Files likely to need changes together with `file`: combines git co-change history, references in both
     directions (who calls it / what it uses) and semantic similarity. Use before editing to find callers,
@@ -169,7 +210,7 @@ def related_files(file: str, path: str | None = None, k: int = 10) -> str:
     return _with_note("\n".join(lines), note)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def find_tests(target: str, path: str | None = None, k: int = 8) -> str:
     """Tests that cover a file ("src/auth.py"), a location ("src/auth.py:42") or a symbol ("validate_token").
     Uses naming conventions, references to the target's symbols, and semantic similarity."""
@@ -184,7 +225,7 @@ def find_tests(target: str, path: str | None = None, k: int = 8) -> str:
     return _with_note("\n".join(lines), note)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def explain_area(path: str | None = None, path_glob: str | None = None, clusters: int | None = None) -> str:
     """Map of a codebase: groups files into functional areas by embedding similarity and labels each with
     its main terms, directories, core files and key symbols. Good first call in an unfamiliar repo.
@@ -193,7 +234,7 @@ def explain_area(path: str | None = None, path_glob: str | None = None, clusters
     return _with_note(search.explain_area(store, path_glob, clusters), note)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def search_history(query: str, path: str | None = None, file: str | None = None, k: int = 8) -> str:
     """Search git history by meaning: "when did we change retry logic and why", "commit that added rate limiting".
     Indexes commit messages, changed files and changed function names. `file` limits to commits touching that
@@ -202,7 +243,7 @@ def search_history(query: str, path: str | None = None, file: str | None = None,
     return _with_note(search.search_history(store, query, k=k, path=file), note)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def index_repo(path: str | None = None, include_history: bool = True) -> dict:
     """Build or update the index now (normally automatic). Only changed files are re-embedded, and chunks seen
     before (e.g. on another branch) come from the embedding cache."""
@@ -214,7 +255,7 @@ def index_repo(path: str | None = None, include_history: bool = True) -> dict:
     return stats
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 def index_status(path: str | None = None, all_repos: bool = False) -> dict | list:
     """What is indexed: files, chunks, commits, model, watcher state. all_repos=true lists every indexed repo."""
     stores = all_stores() if all_repos else [Store(indexer.resolve_root(path))]
@@ -236,12 +277,91 @@ def index_status(path: str | None = None, all_repos: bool = False) -> dict | lis
             "head": head[:10] if head else None, "watching": WATCHERS.active(s.root),
             "indexing_now": bool(job and job[0].is_alive()),
             "model": config.CFG.model_tag, "backend": config.CFG.backend,
+            "device": getattr(embed._instance, "device_desc", None),
             "reranker": config.CFG.rerank_model or None, "db": str(s.path),
         })
     return out if all_repos else out[0]
 
 
-def _warm_configured_repos():
+@tool
+def prepare_context(task: str, path: str | None = None, repos: list[str] | None = None, budget_tokens: int = 6000,
+                    path_glob: str | None = None) -> str:
+    """Best first call for a coding task: everything relevant in one answer, sized to a token budget.
+    Returns the most relevant code in full, the next most relevant as signatures, what that code calls and
+    who calls it, the covering tests and related commits. Every item has a handle for `expand`.
+
+    Args:
+      task: the task or question, in plain words (paste the issue or request)
+      path: any directory in the repo (default: current project)
+      repos: several repos at once: list of paths, or ["all"]
+      budget_tokens: rough size limit of the answer
+      path_glob: limit to matching files, e.g. "src/**"
+    """
+    stores, note = _stores(path, repos)
+    return _with_note(context.build(stores, task, budget_tokens, path_glob)["markdown"], note)
+
+
+@tool
+def expand(handle: str, path: str | None = None) -> str:
+    """Full, current code for a handle from prepare_context or search results: "src/a.py:12-40", "src/a.py:12"
+    (the chunk around that line), "src/a.py::UserStore.save", a symbol name, or a file path."""
+    store, note = _prepare(path)
+    return _with_note(context.expand(store, handle), note)
+
+
+@tool
+def find_definition(symbol: str, path: str | None = None) -> str:
+    """Where a function, class, method or type is defined ("save" or "UserStore.save"), with its signature."""
+    store, note = _prepare(path)
+    return _with_note(graph.format_definitions(graph.definitions(store, symbol), symbol), note)
+
+
+@tool
+def find_references(symbol: str, path: str | None = None, k: int = 30) -> str:
+    """Every place that uses a symbol, grouped by file with the matching lines: "who calls this" and "what breaks
+    if I change it". Matches by name, so same-named symbols in different classes are included."""
+    store, note = _prepare(path)
+    return _with_note(graph.format_references(graph.references(store, symbol, k=k)), note)
+
+
+# ---------------------------------------------------------------- internal (daemon only, not MCP tools)
+
+def warm(path: str) -> str:
+    """Start indexing a client's project in the background so its first search is fast."""
+    root = indexer.resolve_root(path)
+    _start_index(root)
+    return str(root)
+
+
+def auto_context(prompt: str, path: str, min_score: float | None = None, k: int = 5) -> str:
+    """Pointers for the prompt hook: a few likely-relevant locations, or "" when nothing is a confident match.
+    Never waits for a first index."""
+    root = indexer.resolve_root(path)
+    store = Store(root)
+    with store.connect() as con:
+        indexed = con.execute("SELECT COUNT(*) FROM files").fetchone()[0] > 0
+    if not indexed or not WATCHERS.active(root):
+        _start_index(root)
+        if not indexed:
+            return ""
+    floor = min_score if min_score is not None else float(os.environ.get("CODE_EMBED_HOOK_MIN_SCORE", "0.5"))
+    hits = [h for h in search.search([store], prompt, k=k) if h["score"] >= floor]
+    if not hits:
+        return ""
+    lines = ["code-search: code that may be relevant to this request (pre-fetched by a hook; verify before "
+             "relying on it, and use prepare_context / expand for more):"]
+    for h in hits:
+        r = h["row"]
+        sig = (r.get("signature") or "").strip() or (r["text"].strip().splitlines() or [""])[0].strip()
+        sym = f" `{r['symbol']}`" if r.get("symbol") else ""
+        lines.append(f"- {r['path']}:{r['start']}-{r['end']}{sym} — {sig[:120]}")
+    return "\n".join(lines)
+
+
+TOOLS.update(warm=warm, auto_context=auto_context)
+
+
+def warm_configured_repos():
     for p in config.CFG.repos:
         try:
             _start_index(indexer.resolve_root(p))
@@ -249,8 +369,19 @@ def _warm_configured_repos():
             indexer.log(f"could not index {p}: {e}")
 
 
+def _connect_daemon():
+    """Start (or find) the shared daemon right away and have it index this client's project."""
+    try:
+        daemon.call("warm", {"path": str(indexer.resolve_root(None))}, timeout=30)
+    except Exception as e:
+        indexer.log(f"daemon not available yet ({e}); tools will retry or run in this process")
+
+
 def run():
-    threading.Thread(target=_warm_configured_repos, daemon=True).start()
+    if daemon.enabled():
+        threading.Thread(target=_connect_daemon, daemon=True).start()
+    else:
+        threading.Thread(target=warm_configured_repos, daemon=True).start()
     try:
         mcp.run()
     finally:

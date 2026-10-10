@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>code-search</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236d5efc'/%3E%3Ccircle cx='14' cy='14' r='6' fill='none' stroke='white' stroke-width='3'/%3E%3Cpath d='M19 19l6 6' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f7f7f9; --panel: #ffffff; --panel-2: #f1f1f5; --border: #e3e3ea; --text: #17171c;
+  --muted: #6b6b78; --accent: #6d5efc; --accent-soft: #6d5efc1a; --ok: #1f9d55; --warn: #c07a00;
+  --err: #d64545; --code-bg: #fafafc; --shadow: 0 1px 2px #0000000d, 0 4px 16px #00000008;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e0e12; --panel: #16161c; --panel-2: #1d1d25; --border: #2a2a35; --text: #ececf1;
+    --muted: #9696a6; --accent: #8b7fff; --accent-soft: #8b7fff22; --code-bg: #121217;
+    --shadow: 0 1px 2px #0000004d, 0 4px 16px #00000033;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e0e12; --panel: #16161c; --panel-2: #1d1d25; --border: #2a2a35; --text: #ececf1;
+  --muted: #9696a6; --accent: #8b7fff; --accent-soft: #8b7fff22; --code-bg: #121217;
+  --shadow: 0 1px 2px #0000004d, 0 4px 16px #00000033;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+button, input, select { font: inherit; color: inherit; }
+a { color: var(--accent); }
+
+.app { display: grid; grid-template-columns: 220px 1fr; height: 100vh; }
+aside { border-right: 1px solid var(--border); background: var(--panel); padding: 16px 12px; display: flex; flex-direction: column; gap: 4px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 15px; padding: 4px 8px 16px; }
+.brand svg { flex: none; }
+.nav { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 8px; border: 0; background: none; cursor: pointer; text-align: left; color: var(--muted); }
+.nav:hover { background: var(--panel-2); color: var(--text); }
+.nav[aria-current="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.nav kbd { margin-left: auto; }
+.nav svg { width: 16px; height: 16px; flex: none; }
+.spacer { flex: 1; }
+.device { font-size: 12px; color: var(--muted); padding: 10px; border: 1px solid var(--border); border-radius: 10px; display: grid; gap: 2px; }
+.device b { color: var(--text); font-weight: 600; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+.dot.gpu { background: var(--ok); } .dot.cpu { background: var(--warn); }
+
+main { overflow: auto; }
+.top { position: sticky; top: 0; z-index: 2; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); padding: 12px 28px; display: flex; gap: 10px; align-items: center; }
+.top h1 { font-size: 15px; margin: 0; font-weight: 650; }
+.top .grow { flex: 1; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 24px 28px 64px; }
+
+select, input[type="text"] { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; outline: none; min-width: 0; }
+select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.btn { border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 6px 12px; cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+.btn.primary:hover { filter: brightness(1.08); color: white; }
+.btn.sm { padding: 3px 9px; font-size: 12px; }
+.icon-btn { border: 0; background: none; cursor: pointer; color: var(--muted); padding: 6px; border-radius: 8px; display: grid; place-items: center; }
+.icon-btn:hover { background: var(--panel-2); color: var(--text); }
+kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; background: var(--panel); }
+
+.searchbox { display: flex; align-items: center; gap: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 6px 8px 6px 16px; box-shadow: var(--shadow); }
+.searchbox:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft), var(--shadow); }
+.searchbox input { flex: 1; border: 0; background: none; font-size: 17px; padding: 10px 0; outline: none; box-shadow: none; }
+.searchbox input:focus { box-shadow: none; }
+.searchbox .glob { width: 160px; font: 13px var(--mono); border: 0; background: var(--panel-2); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.hint { color: var(--muted); font-size: 12px; margin: 10px 4px; display: flex; gap: 14px; flex-wrap: wrap; }
+.note { color: var(--warn); font-size: 13px; margin: 12px 4px; }
+
+.results { display: grid; gap: 12px; margin-top: 16px; }
+.hit { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.hit.sel { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.hit-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer; flex-wrap: wrap; }
+.path { font: 13px var(--mono); word-break: break-all; }
+.path .dir { color: var(--muted); }
+.chip { font-size: 11.5px; padding: 1px 8px; border-radius: 99px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+.chip.sym { background: var(--accent-soft); color: var(--accent); font-family: var(--mono); }
+.chip.test { color: var(--ok); }
+.score { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--muted); font: 12px var(--mono); }
+.bar { width: 48px; height: 4px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+.actions { display: flex; gap: 6px; padding: 0 14px 10px; flex-wrap: wrap; }
+pre.code { margin: 0; background: var(--code-bg); border-top: 1px solid var(--border); padding: 10px 0; overflow: auto; max-height: 340px; font: 12.5px/1.6 var(--mono); counter-reset: ln var(--start); }
+pre.code span.l { display: block; padding: 0 14px 0 0; white-space: pre; }
+pre.code span.l::before { counter-increment: ln; content: counter(ln); display: inline-block; width: 4.2em; padding-right: 1.2em; text-align: right; color: var(--muted); opacity: .55; user-select: none; }
+.more { color: var(--muted); font-size: 12px; padding: 6px 14px 10px; background: var(--code-bg); }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+.cards { display: grid; gap: 12px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.card h3 { margin: 0 0 4px; font-size: 14px; }
+.muted { color: var(--muted); }
+.stats { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0; }
+.stats div { display: grid; }
+.stats b { font-size: 18px; font-weight: 650; }
+.stats span { color: var(--muted); font-size: 12px; }
+.progress { height: 6px; border-radius: 6px; background: var(--panel-2); overflow: hidden; margin: 8px 0; }
+.progress i { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+.item { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-top: 1px solid var(--border); }
+.item:first-child { border-top: 0; }
+.item .why { color: var(--muted); font-size: 12.5px; }
+.copyblock { position: relative; }
+.copyblock pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin: 6px 0 0; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-all; }
+.copyblock .btn { position: absolute; top: 6px; right: 6px; }
+.md h1, .md h2, .md h3 { font-size: 14.5px; margin: 18px 0 6px; }
+.md h1:first-child, .md h2:first-child, .md h3:first-child { margin-top: 0; }
+.md code { font: 12.5px var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 5px; }
+.md pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; overflow: auto; }
+.md pre code { background: none; padding: 0; }
+.md ul { padding-left: 20px; margin: 6px 0; }
+.empty { text-align: center; color: var(--muted); padding: 56px 20px; }
+.empty svg { opacity: .5; margin-bottom: 8px; }
+.spinner { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 13px; box-shadow: var(--shadow); opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100vw - 32px); z-index: 10; }
+.toast.show { opacity: 1; }
+.toast.err { background: var(--err); color: white; }
+[hidden] { display: none !important; }
+
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; }
+  aside { flex-direction: row; overflow-x: auto; scrollbar-width: none; padding: 8px; border-right: 0; border-bottom: 1px solid var(--border); }
+  aside::-webkit-scrollbar { display: none; }
+  .hint { display: none; }
+  .brand, .spacer, .device, .nav kbd { display: none; }
+  .nav { flex: none; }
+  .top, .wrap { padding-left: 16px; padding-right: 16px; }
+  .searchbox .glob { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand">
+      <svg width="26" height="26" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="var(--accent)"/><circle cx="14" cy="14" r="6" fill="none" stroke="white" stroke-width="3"/><path d="M19 19l6 6" stroke="white" stroke-width="3" stroke-linecap="round"/></svg>
+      code-search
+    </div>
+    <button class="nav" data-view="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>Search<kbd>1</kbd></button>
+    <button class="nav" data-view="history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>History<kbd>2</kbd></button>
+    <button class="nav" data-view="related"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7.5 10.8 16M16 7.5 13.2 16M8.5 6h7"/></svg>Related<kbd>3</kbd></button>
+    <button class="nav" data-view="tests"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6M10 3v6l-5 9a2 2 0 0 0 1.8 3h10.4a2 2 0 0 0 1.8-3l-5-9V3"/></svg>Tests<kbd>4</kbd></button>
+    <button class="nav" data-view="map"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 6 6-3 6 3 6-3v15l-6 3-6-3-6 3z"/><path d="M9 3v15M15 6v15"/></svg>Map<kbd>5</kbd></button>
+    <button class="nav" data-view="repos"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Repos<kbd>6</kbd></button>
+    <button class="nav" data-view="setup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg>Setup<kbd>7</kbd></button>
+    <div class="spacer"></div>
+    <div class="device" id="device"><span><span class="dot"></span>Model not loaded yet</span></div>
+  </aside>
+
+  <main>
+    <div class="top">
+      <h1 id="title">Search</h1>
+      <div class="grow"></div>
+      <select id="repo" aria-label="Repository"></select>
+      <button class="icon-btn" id="theme" title="Toggle theme" aria-label="Toggle theme">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </div>
+
+    <section class="wrap" data-panel="search">
+      <div class="searchbox">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--muted)"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input type="text" id="q" placeholder="Describe what you're looking for, or type a symbol name" autocomplete="off" spellcheck="false">
+        <input type="text" class="glob" id="glob" placeholder="filter: src/**" spellcheck="false">
+        <div class="spinner" id="qspin" hidden></div>
+      </div>
+      <div class="hint"><span><kbd>/</kbd> focus</span><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>Enter</kbd> open in editor</span><span><kbd>R</kbd> related</span><span><kbd>T</kbd> tests</span><span><kbd>Esc</kbd> clear</span></div>
+      <div class="note" id="qnote" hidden></div>
+      <div class="results" id="results"></div>
+    </section>
+
+    <section class="wrap" data-panel="history" hidden>
+      <form class="searchbox" id="hform">
+        <input type="text" id="hq" placeholder="Why or when did something change? e.g. “retry backoff”" spellcheck="false">
+        <input type="text" class="glob" id="hfile" placeholder="only this file" spellcheck="false">
+        <button class="btn primary">Search</button>
+      </form>
+      <div class="card md" id="hout" style="margin-top:16px" hidden></div>
+    </section>
+
+    <section class="wrap" data-panel="related" hidden>
+      <form class="searchbox" id="rform">
+        <input type="text" id="rfile" placeholder="File path, e.g. src/auth/jwt.py" spellcheck="false">
+        <button class="btn primary">Find</button>
+      </form>
+      <p class="muted" style="margin:10px 4px">Files that change together with this one, call it or are called by it, or have similar content. Check these before editing.</p>
+      <div class="card" id="rout" hidden></div>
+    </section>
+
+    <section class="wrap" data-panel="tests" hidden>
+      <form class="searchbox" id="tform">
+        <input type="text" id="tq" placeholder="File, file:line or symbol name" spellcheck="false">
+        <button class="btn primary">Find</button>
+      </form>
+      <div class="card" id="tout" style="margin-top:16px" hidden></div>
+    </section>
+
+    <section class="wrap" data-panel="map" hidden>
+      <form class="searchbox" id="mform">
+        <input type="text" id="mglob" placeholder="Optional: limit to a folder, e.g. src/**" spellcheck="false">
+        <button class="btn primary">Map this repo</button>
+      </form>
+      <p class="muted" style="margin:10px 4px">Groups the repo into functional areas with their core files and key symbols.</p>
+      <div class="card md" id="mout" hidden></div>
+    </section>
+
+    <section class="wrap" data-panel="repos" hidden>
+      <form class="searchbox" id="aform">
+        <input type="text" id="apath" placeholder="Add a repo: full folder path" spellcheck="false">
+        <button class="btn primary">Index</button>
+      </form>
+      <div class="cards" id="repolist" style="margin-top:16px"></div>
+    </section>
+
+    <section class="wrap" data-panel="setup" hidden>
+      <div class="grid2">
+        <div class="card" id="gpucard"></div>
+        <div class="card" id="modelcard"></div>
+      </div>
+      <h3 style="margin:28px 4px 4px;font-size:14px">Connect an agent</h3>
+      <p class="muted" style="margin:0 4px 12px">Paths below are for this machine.</p>
+      <div class="cards" id="connect"></div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const TOKEN = "__TOKEN__";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const state = { view: "search", hits: [], sel: -1, repos: [], system: null, seq: 0 };
+
+async function api(path, params = {}, method = "GET") {
+  let url = path, opts = { method, headers: { "X-Token": TOKEN } };
+  if (method === "GET") {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""));
+    url += (q.toString() ? "?" + q : "");
+  } else {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(params);
+  }
+  const r = await fetch(url, opts);
+  const data = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok || data.error) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
+}
+
+let toastTimer;
+function toast(msg, err = false) {
+  const t = $("#toast");
+  t.textContent = msg; t.className = "toast show" + (err ? " err" : "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = "toast", err ? 5000 : 1800);
+}
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); toast("Copied"); } catch { toast("Copy failed", true); }
+}
+
+// ---------------------------------------------------------------- theme
+function applyTheme(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+}
+try { applyTheme(localStorage.getItem("cs-theme")); } catch {}
+$("#theme").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const next = cur === "dark" ? "light" : "dark";
+  applyTheme(next);
+  try { localStorage.setItem("cs-theme", next); } catch {}
+};
+
+// ---------------------------------------------------------------- navigation
+const TITLES = { search: "Search", history: "History", related: "Related files", tests: "Find tests", map: "Repo map", repos: "Repos", setup: "Setup" };
+function show(view) {
+  state.view = view;
+  $$(".nav").forEach(b => b.setAttribute("aria-current", b.dataset.view === view));
+  $$("[data-panel]").forEach(p => p.hidden = p.dataset.panel !== view);
+  $("#title").textContent = TITLES[view];
+  $("#repo").hidden = view === "setup";
+  if (view === "repos") loadRepos();
+  if (view === "setup") loadSystem();
+  const first = $(`[data-panel="${view}"] input`);
+  if (first) setTimeout(() => first.focus(), 0);
+}
+$$(".nav").forEach(b => b.onclick = () => show(b.dataset.view));
+
+function repo() { return $("#repo").value || undefined; }
+function hitRepo(h) { return state.repos.find(r => r.root === h.root) ? h.root : repo(); }
+
+// ---------------------------------------------------------------- repos
+async function loadRepos() {
+  try { state.repos = await api("/api/repos"); } catch (e) { toast(e.message, true); return; }
+  const sel = $("#repo"), prev = sel.value || (() => { try { return localStorage.getItem("cs-repo"); } catch { return null; } })();
+  sel.innerHTML = `<option value="all">All repos</option>` +
+    state.repos.map(r => `<option value="${esc(r.root)}">${esc(r.root.split(/[\\/]/).pop())}</option>`).join("");
+  sel.value = state.repos.some(r => r.root === prev) || prev === "all" ? prev : (state.repos[0]?.root || "all");
+  renderRepos();
+  if (state.repos.some(r => r.indexing_now)) setTimeout(() => state.view === "repos" && loadRepos(), 2000);
+}
+$("#repo").onchange = () => {
+  try { localStorage.setItem("cs-repo", $("#repo").value); } catch {}
+  if ($("#q").value.trim()) runSearch();
+};
+
+function renderRepos() {
+  const el = $("#repolist");
+  if (!state.repos.length) {
+    el.innerHTML = `<div class="empty">No repos indexed yet. Add one above.</div>`;
+    return;
+  }
+  el.innerHTML = state.repos.map(r => {
+    const p = r.progress, pct = p && p.total ? Math.round(100 * (p.done || 0) / p.total) : 0;
+    const langs = Object.entries(r.languages || {}).map(([l, n]) => `<span class="chip">${esc(l || "other")} ${n}</span>`).join(" ");
+    return `<div class="card">
+      <div class="row"><h3>${esc(r.root.split(/[\\/]/).pop())}</h3>
+        ${r.indexing_now ? `<span class="chip">indexing…</span>` : r.watching ? `<span class="chip test">watching</span>` : ""}
+        <div class="grow" style="flex:1"></div>
+        <button class="btn sm" data-reindex="${esc(r.root)}">Re-index</button></div>
+      <div class="muted path">${esc(r.root)}</div>
+      ${r.indexing_now ? `<div class="progress"><i style="width:${pct}%"></i></div><div class="muted">${p?.done || 0} / ${p?.total || "?"} files</div>` : ""}
+      <div class="stats"><div><b>${r.files}</b><span>files</span></div><div><b>${r.chunks}</b><span>chunks</span></div>
+        <div><b>${r.commits}</b><span>commits</span></div><div><b>${esc(r.last_indexed || "never")}</b><span>last indexed</span></div></div>
+      <div class="row">${langs}</div></div>`;
+  }).join("");
+  $$("[data-reindex]", el).forEach(b => b.onclick = () => startIndex(b.dataset.reindex));
+}
+async function startIndex(path) {
+  try {
+    const r = await api("/api/index", { path }, "POST");
+    toast(`Indexing ${r.root.split(/[\\/]/).pop()}…`);
+    setTimeout(loadRepos, 600);
+  } catch (e) { toast(e.message, true); }
+}
+$("#aform").onsubmit = e => { e.preventDefault(); const p = $("#apath").value.trim(); if (p) { startIndex(p); $("#apath").value = ""; } };
+
+// ---------------------------------------------------------------- search
+function splitPath(p) {
+  const i = p.lastIndexOf("/");
+  return i < 0 ? `<span>${esc(p)}</span>` : `<span class="dir">${esc(p.slice(0, i + 1))}</span>${esc(p.slice(i + 1))}`;
+}
+function codeBlock(text, start) {
+  return `<pre class="code" style="--start:${start - 1}">` +
+    text.split("\n").map(l => `<span class="l">${esc(l) || " "}</span>`).join("") + `</pre>`;
+}
+function renderHits() {
+  const el = $("#results");
+  if (!state.hits.length) {
+    el.innerHTML = $("#q").value.trim() ? `<div class="empty">No matches.</div>` :
+      `<div class="empty"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+       <div>Search by meaning (“where are JWTs validated”) or by name (“fetchWithRetry”).</div></div>`;
+    return;
+  }
+  const max = Math.max(...state.hits.map(h => h.score), 0.0001);
+  const multi = repo() === "all";
+  el.innerHTML = state.hits.map((h, i) => `
+    <div class="hit${i === state.sel ? " sel" : ""}" data-i="${i}">
+      <div class="hit-head">
+        <span class="path">${splitPath(h.path)}<span class="muted">:${h.start}-${h.end}</span></span>
+        ${h.symbol && h.kind !== "image" ? `<span class="chip sym">${esc(h.symbol)}</span>` : ""}
+        ${h.kind && h.kind !== "image" ? `<span class="chip">${esc(h.kind)}</span>` : ""}
+        ${multi ? `<span class="chip">${esc(h.repo)}</span>` : ""}
+        <span class="score"><span class="bar"><i style="width:${Math.max(4, 100 * h.score / max)}%"></i></span>${h.score.toFixed(3)}</span>
+      </div>
+      <div class="actions">
+        <button class="btn sm" data-act="open">Open</button>
+        <button class="btn sm" data-act="related">Related</button>
+        <button class="btn sm" data-act="tests">Tests</button>
+        <button class="btn sm" data-act="copy">Copy path</button>
+      </div>
+      ${h.kind === "image" ? "" : codeBlock(h.text, h.start)}
+      ${h.more ? `<div class="more">… ${h.more} more lines</div>` : ""}
+    </div>`).join("");
+  $$(".hit", el).forEach(card => {
+    const h = state.hits[+card.dataset.i];
+    $(".hit-head", card).onclick = () => select(+card.dataset.i);
+    $$("[data-act]", card).forEach(b => b.onclick = () => act(b.dataset.act, h));
+  });
+}
+function select(i, scroll = false) {
+  state.sel = i;
+  $$(".hit").forEach(c => c.classList.toggle("sel", +c.dataset.i === i));
+  if (scroll) $(`.hit[data-i="${i}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+async function act(what, h) {
+  if (what === "open") {
+    try { const r = await api("/api/open", { root: h.root, path: h.path, line: h.start }, "POST"); toast(`Opened in ${r.editor}`); }
+    catch (e) { toast(e.message, true); }
+  } else if (what === "copy") {
+    copy(`${h.path}:${h.start}`);
+  } else if (what === "related") {
+    setRepo(h.root); $("#rfile").value = h.path; show("related"); runRelated();
+  } else if (what === "tests") {
+    setRepo(h.root); $("#tq").value = h.symbol && h.kind !== "image" ? h.symbol.split(".").pop() : h.path; show("tests"); runTests();
+  }
+}
+function setRepo(root) { if (state.repos.some(r => r.root === root)) $("#repo").value = root; }
+
+let debounce;
+$("#q").oninput = () => { clearTimeout(debounce); debounce = setTimeout(runSearch, 300); };
+$("#glob").oninput = () => { clearTimeout(debounce); debounce = setTimeout(runSearch, 300); };
+async function runSearch() {
+  const q = $("#q").value.trim(), seq = ++state.seq;
+  if (!q) { state.hits = []; state.sel = -1; $("#qnote").hidden = true; renderHits(); return; }
+  $("#qspin").hidden = false;
+  try {
+    const r = await api("/api/search", { q, repo: repo(), glob: $("#glob").value.trim(), k: 12 });
+    if (seq !== state.seq) return;  // a newer query already went out
+    state.hits = r.hits; state.sel = r.hits.length ? 0 : -1;
+    $("#qnote").hidden = !r.note; $("#qnote").textContent = r.note || "";
+    renderHits();
+    if (!state.system?.device) loadSystem();
+  } catch (e) { if (seq === state.seq) toast(e.message, true); }
+  finally { if (seq === state.seq) $("#qspin").hidden = true; }
+}
+
+// ---------------------------------------------------------------- related / tests / history / map
+function busy(el) { el.hidden = false; el.innerHTML = `<div class="row muted"><div class="spinner"></div>Working…</div>`; }
+function noteHtml(n) { return n ? `<div class="note" style="margin:0 0 10px">${esc(n)}</div>` : ""; }
+function fileItem(path, chips, why) {
+  return `<div class="item"><div style="flex:1;min-width:0"><div class="path">${splitPath(path)} ${chips}</div>
+    ${why ? `<div class="why">${why}</div>` : ""}</div>
+    <button class="btn sm" data-open="${esc(path)}">Open</button></div>`;
+}
+function wireOpen(el) {
+  $$("[data-open]", el).forEach(b => b.onclick = async () => {
+    try { const r = await api("/api/open", { root: repo(), path: b.dataset.open, line: 1 }, "POST"); toast(`Opened in ${r.editor}`); }
+    catch (e) { toast(e.message, true); }
+  });
+}
+function needRepo() {
+  if (repo() === "all" || !repo()) { toast("Pick a single repo at the top first", true); return false; }
+  return true;
+}
+async function runRelated() {
+  const file = $("#rfile").value.trim(), el = $("#rout");
+  if (!file || !needRepo()) return;
+  busy(el);
+  try {
+    const r = await api("/api/related", { repo: repo(), file });
+    el.innerHTML = noteHtml(r.note) + (r.items.length ? r.items.map(it =>
+      fileItem(it.path, `${it.test ? `<span class="chip test">test</span>` : ""} <span class="chip">${it.score}</span>`,
+        esc((it.why || []).join(" · ")))).join("") : `<div class="muted">Nothing related found.</div>`);
+    wireOpen(el);
+  } catch (e) { el.hidden = true; toast(e.message, true); }
+}
+async function runTests() {
+  const target = $("#tq").value.trim(), el = $("#tout");
+  if (!target || !needRepo()) return;
+  busy(el);
+  try {
+    const r = await api("/api/tests", { repo: repo(), target });
+    el.innerHTML = noteHtml(r.note) + (r.items.length ? r.items.map(it =>
+      fileItem(it.path, `<span class="chip">${it.score}</span>`,
+        esc([...(it.why || []), it.best_test ? `best match: ${it.best_test}` : ""].filter(Boolean).join(" · ")))).join("")
+      : `<div class="muted">No tests found.</div>`);
+    wireOpen(el);
+  } catch (e) { el.hidden = true; toast(e.message, true); }
+}
+function md(text) {
+  const out = []; let code = null, list = false;
+  const inline = s => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|\s)_([^_]+)_(?=\s|$)/g, "$1<i>$2</i>");
+  for (const line of String(text).split("\n")) {
+    if (line.startsWith("```")) {
+      if (code !== null) { out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`); code = null; }
+      else { if (list) { out.push("</ul>"); list = false; } code = []; }
+      continue;
+    }
+    if (code !== null) { code.push(line); continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)/), li = line.match(/^\s*[-*]\s+(.*)/);
+    if (li) { if (!list) { out.push("<ul>"); list = true; } out.push(`<li>${inline(li[1])}</li>`); continue; }
+    if (list) { out.push("</ul>"); list = false; }
+    if (h) out.push(`<h3>${inline(h[2])}</h3>`);
+    else if (line.trim()) out.push(`<p style="margin:4px 0">${inline(line)}</p>`);
+  }
+  if (code !== null) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+  if (list) out.push("</ul>");
+  return out.join("");
+}
+async function runHistory() {
+  const q = $("#hq").value.trim(), el = $("#hout");
+  if (!q || !needRepo()) return;
+  busy(el);
+  try { const r = await api("/api/history", { repo: repo(), q, file: $("#hfile").value.trim() }); el.innerHTML = noteHtml(r.note) + md(r.markdown); }
+  catch (e) { el.hidden = true; toast(e.message, true); }
+}
+async function runMap() {
+  const el = $("#mout");
+  if (!needRepo()) return;
+  busy(el);
+  try { const r = await api("/api/explain", { repo: repo(), glob: $("#mglob").value.trim() }); el.innerHTML = noteHtml(r.note) + md(r.markdown); }
+  catch (e) { el.hidden = true; toast(e.message, true); }
+}
+$("#rform").onsubmit = e => { e.preventDefault(); runRelated(); };
+$("#tform").onsubmit = e => { e.preventDefault(); runTests(); };
+$("#hform").onsubmit = e => { e.preventDefault(); runHistory(); };
+$("#mform").onsubmit = e => { e.preventDefault(); runMap(); };
+
+// ---------------------------------------------------------------- setup
+async function loadSystem() {
+  let s;
+  try { s = state.system = await api("/api/system"); } catch (e) { toast(e.message, true); return; }
+  const gpu = s.device && s.device !== "CPU";
+  $("#device").innerHTML = s.device
+    ? `<span><span class="dot ${gpu ? "gpu" : "cpu"}"></span><b>${gpu ? "GPU" : "CPU"}</b></span><span>${esc(s.device)}</span>`
+    : `<span><span class="dot"></span>Model not loaded yet</span>`;
+  $("#gpucard").innerHTML = `<h3>Hardware</h3>
+    <div class="muted" style="margin-bottom:8px">${s.gpus.length ? s.gpus.map(esc).join("<br>") : "No GPU detected"}</div>
+    <div>Running on: <b>${esc(s.device || "loads on first search")}</b></div>
+    <div class="muted" style="margin-top:6px">${s.setup_needed ? "Setup will: " + esc(s.plan) : gpu ? "PyTorch is set up for this GPU." : ""}</div>
+    ${s.setup_needed ? `<div class="note" style="margin:10px 0 4px">PyTorch isn't set up for this machine yet. Stop this UI, run the command below, then start it again.</div>
+      <div class="copyblock"><pre>${esc(s.setup_command)}</pre><button class="btn sm" data-copy="${esc(s.setup_command)}">Copy</button></div>` : ""}`;
+  $("#modelcard").innerHTML = `<h3>Model</h3>
+    <div>Embedding: <b>${esc(s.model)}</b></div><div>Backend: <b>${esc(s.backend)}</b></div>
+    <div>Reranker: <b>${esc(s.reranker || "off")}</b></div>
+    <div class="muted path" style="margin-top:8px">${esc(s.project)}</div>`;
+  const blocks = [["Claude Code", s.connect.claude_code], ["Codex", s.connect.codex],
+                  ["Claude Desktop (claude_desktop_config.json)", s.connect.claude_desktop]];
+  $("#connect").innerHTML = blocks.map(([name, text]) => `<div class="card"><h3>${esc(name)}</h3>
+    <div class="copyblock"><pre>${esc(text)}</pre><button class="btn sm" data-copy="${esc(text)}">Copy</button></div></div>`).join("");
+  $$("[data-copy]").forEach(b => b.onclick = () => copy(b.dataset.copy));
+}
+
+// ---------------------------------------------------------------- keyboard
+document.addEventListener("keydown", e => {
+  const typing = ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName);
+  if (e.key === "/" && !typing) { e.preventDefault(); show("search"); $("#q").focus(); return; }
+  if (!typing && !e.ctrlKey && !e.metaKey && !e.altKey && /^[1-7]$/.test(e.key)) { show($$(".nav")[+e.key - 1].dataset.view); return; }
+  if (state.view !== "search") return;
+  if (e.key === "Escape") { $("#q").value = ""; runSearch(); $("#q").focus(); return; }
+  if (!state.hits.length) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); select(Math.min(state.sel + 1, state.hits.length - 1), true); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); select(Math.max(state.sel - 1, 0), true); }
+  else if (e.key === "Enter" && state.sel >= 0 && document.activeElement !== $("#glob")) { e.preventDefault(); act("open", state.hits[state.sel]); }
+  else if (!typing && (e.key === "r" || e.key === "t") && state.sel >= 0) act(e.key === "r" ? "related" : "tests", state.hits[state.sel]);
+});
+
+show("search");
+renderHits();
+loadRepos();
+loadSystem();
+setInterval(() => { if (!state.system?.device) loadSystem(); }, 5000);
+</script>
+</body>
+</html>

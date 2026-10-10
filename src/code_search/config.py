@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+def _env(name: str, default: str = "", strip: bool = True) -> str:
+    v = os.environ.get(name, default)
+    return v.strip() if strip else v
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -30,9 +31,9 @@ class Config:
     batch: int = field(default_factory=lambda: int(_env("CODE_EMBED_BATCH", "32")))
 
     # prompts from the EmbeddingGemma 2 model card (code retrieval task)
-    # (read raw, not stripped: the trailing space in the prefix matters)
-    query_prefix: str = field(default_factory=lambda: os.environ.get("CODE_EMBED_QUERY_PREFIX", "task: code retrieval | query: "))
-    doc_template: str = field(default_factory=lambda: os.environ.get("CODE_EMBED_DOC_TEMPLATE", "title: {title} | text: {text}"))
+    # (not stripped: the trailing space in the prefix matters)
+    query_prefix: str = field(default_factory=lambda: _env("CODE_EMBED_QUERY_PREFIX", "task: code retrieval | query: ", strip=False))
+    doc_template: str = field(default_factory=lambda: _env("CODE_EMBED_DOC_TEMPLATE", "title: {title} | text: {text}", strip=False))
 
     # optional cross-encoder reranker, e.g. "BAAI/bge-reranker-v2-m3"
     rerank_model: str = field(default_factory=lambda: _env("CODE_EMBED_RERANK"))

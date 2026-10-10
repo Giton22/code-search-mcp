@@ -114,6 +114,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("CODE_EMBED_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("CODE_EMBED_WATCH_DEBOUNCE", "0.5")
     monkeypatch.setenv("CODE_EMBED_IMAGES", "1")
+    monkeypatch.setenv("CODE_EMBED_DAEMON", "0")  # in-process; test_daemon covers the shared service
     from code_search import config, embed
 
     config.reload()
@@ -286,8 +287,8 @@ def test_watcher(repo):
         wm.stop_all()
 
 
-def test_eval_and_pairs(repo, env):
-    from code_search import evaluate, finetune, indexer
+def test_eval(repo, env):
+    from code_search import evaluate, indexer
 
     indexer.index(repo)
     out = env / "eval.jsonl"
@@ -298,18 +299,15 @@ def test_eval_and_pairs(repo, env):
     manual = env / "manual.jsonl"
     manual.write_text(json.dumps({"query": "validate a jwt", "expected": ["src/auth/jwt.py::validate_token"]}) + "\n")
     assert evaluate.run(repo, manual, k=5)["recall@5"] == 1.0
-    pairs = finetune.build_pairs(repo)
-    assert any(p["src"] == "doc" and "Validate a JWT access token" in p["query"] for p in pairs)
-    doc_pair = next(p for p in pairs if p["query"].startswith("Validate a JWT"))
-    assert "Validate a JWT" not in doc_pair["text"]  # docstring removed from the positive
 
 
 def test_concurrent_processes_no_duplicates(repo, env):
     code = ("import sys; sys.path.insert(0, %r); from code_search import indexer; indexer.index(indexer.resolve_root(%r))"
             % (str(Path(__file__).parents[1] / "src"), str(repo)))
-    procs = [subprocess.Popen([sys.executable, "-c", code], env=os.environ.copy(),
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(3)]
-    assert all(p.wait(60) == 0 for p in procs)
+    procs = [subprocess.Popen([sys.executable, "-c", code], env=os.environ.copy(), text=True,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) for _ in range(3)]
+    errors = [err for p in procs for err in [p.communicate(timeout=60)[1]] if p.returncode]
+    assert not errors, errors[0][-2000:]
     from code_search.store import Store
 
     with Store(repo).connect() as con:
@@ -338,7 +336,10 @@ def test_mcp_stdio(repo, env):
         tools = rpc(2, "tools/list")["result"]["tools"]
         names = {t["name"] for t in tools}
         assert names == {"search_code", "search_by_image", "find_similar", "related_files", "find_tests",
-                         "explain_area", "search_history", "index_repo", "index_status"}
+                         "explain_area", "search_history", "index_repo", "index_status", "prepare_context",
+                         "expand", "find_definition", "find_references"}
+        schema = next(t for t in tools if t["name"] == "search_code")["inputSchema"]
+        assert {"query", "path", "k"} <= set(schema["properties"]) and schema["required"] == ["query"]
         assert all(t["annotations"]["readOnlyHint"] for t in tools)
         res = rpc(3, "tools/call", {"name": "search_code", "arguments": {"query": "validate_token", "k": 1}})
         text = res["result"]["content"][0]["text"]
@@ -353,8 +354,172 @@ def test_prompts_keep_whitespace(monkeypatch):
     monkeypatch.setenv("CODE_EMBED_BACKEND", "st")
     from code_search import config, embed
 
+    monkeypatch.setattr(config, "CFG", config.CFG)  # restore the global config after the test
     cfg = config.reload()
     e = embed.Embedder(cfg)
     assert e.query_text("find f") == "task: code retrieval | query: find f"
     assert e.doc_text("a.py f", "x") == "title: a.py f | text: x"
     assert e.doc_text("", "x") == "title: none | text: x"
+
+
+
+def test_hardware_detection_and_plan():
+    from code_search import hardware as hw
+
+    assert hw.amd_gfx("AMD Radeon RX 9070 XT") == "gfx1201"
+    assert hw.amd_gfx("AMD Radeon RX 9060 XT") == "gfx1200"
+    assert hw.amd_gfx("AMD Radeon RX 7900 XTX") == "gfx1100"
+    assert hw.amd_gfx("AMD Radeon(TM) Graphics") is None
+    assert (hw.kfd_gfx(120001), hw.kfd_gfx(110000), hw.kfd_gfx(90010), hw.kfd_gfx(0)) == \
+        ("gfx1201", "gfx1100", "gfx90a", None)
+
+    igpu = {"vendor": "amd", "name": "AMD Radeon(TM) Graphics", "gfx": None}
+    rdna4 = {"vendor": "amd", "name": "AMD Radeon RX 9070 XT", "gfx": "gfx1201"}
+    nvidia = {"vendor": "nvidia", "name": "NVIDIA GeForce RTX 4090", "gfx": None}
+    assert hw.best_gpu([igpu, rdna4]) == rdna4 and hw.best_gpu([igpu]) is None
+    assert hw.best_gpu([rdna4, nvidia]) == nvidia
+
+    _, cmd = hw.install_plan(rdna4, uv="uv", python="py")
+    assert cmd[cmd.index("--index") + 1] == hw.AMD_INDEX  # --index outranks PyPI; --index-url would not
+    assert "torch[device-gfx1201]" in cmd and "--reinstall-package" in cmd
+    _, cmd = hw.install_plan(nvidia, uv="uv", python="py")
+    assert cmd[cmd.index("--torch-backend") + 1] == "auto"
+    assert all("--no-config" in hw.install_plan(g)[1] for g in (rdna4, nvidia, None))  # project excludes torch
+    _, cmd = hw.install_plan({"vendor": "apple", "name": "Apple Silicon", "gfx": None})
+    assert "--torch-backend" not in cmd and "torch" in cmd  # PyPI's macOS build has MPS
+    _, cmd = hw.install_plan(None)
+    assert cmd[cmd.index("--torch-backend") + 1] == "cpu"
+
+
+def test_ui_api(repo, env):
+    import threading
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from code_search import ui
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ui.Handler)
+    ui.Handler.token, ui.Handler.port = "t0k", httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{ui.Handler.port}"
+
+    def get(path, headers=None):
+        req = urllib.request.Request(base + path, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    try:
+        status, page = get("/")
+        assert status == 200 and b"t0k" in page  # the page carries the token for its own API calls
+        assert get("/api/system")[0] == 403  # no token
+        assert get("/api/system", {"X-Token": "t0k", "Host": "evil.example"})[0] == 403  # DNS rebinding
+        q = urllib.parse.urlencode({"q": "validate a jwt", "repo": str(repo)})
+        status, body = get(f"/api/search?{q}", {"X-Token": "t0k"})
+        hits = json.loads(body)["hits"]
+        assert status == 200 and any(h["path"] == "src/auth/jwt.py" for h in hits)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_graph_context_expand(repo, env):
+    from code_search import context, graph, indexer
+    from code_search.store import Store
+
+    indexer.index(repo)
+    store = Store(repo)
+    defs = graph.definitions(store, "validate_token")
+    assert [d["path"] for d in defs] == ["src/auth/jwt.py"]
+    refs = graph.references(store, "validate_token")
+    assert "src/auth/jwt.py" in refs["files"] and "tests/test_jwt.py" in refs["files"]  # refresh_token + the test
+    assert all(u["symbol"] != "validate_token" for u in refs["files"]["src/auth/jwt.py"])  # not its own definition
+    calls = graph.callees(store, defs[0]["id"], defs[0]["path"])
+    assert any(c["name"] == "load_key" and c["path"] == "src/auth/keys.py" for c in calls)
+    assert graph.ref_names('x = "load_key"  # validate_token\nfoo(bar)') == {"foo", "bar"}  # not strings/comments
+
+    res = context.build([store], "validate a JWT access token", budget=1500)
+    md = res["markdown"]
+    assert "src/auth/jwt.py" in md and res["files"][0] == "src/auth/jwt.py"
+    assert "Calls:" in md and "src/auth/keys.py" in md
+    assert res["tokens"] <= 1500 * 1.1
+
+    assert "def validate_token" in context.expand(store, "src/auth/jwt.py::validate_token")
+    assert "def load_key" in context.expand(store, "src/auth/keys.py:4")
+    assert "def load_key" in context.expand(store, "load_key")
+    assert "export class ApiClient" in context.expand(store, "src/http/client.ts")
+
+
+def test_hook(repo, env, tmp_path, monkeypatch):
+    import io
+
+    from code_search import daemon, hook, indexer, server
+    from code_search.watcher import WATCHERS
+
+    assert not hook.worth_searching("ok thanks")
+    assert not hook.worth_searching("/review")
+    assert hook.worth_searching("where do we validate JWT tokens before requests?")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "x"}]}]}}))
+    monkeypatch.setattr(hook, "_settings_path", lambda scope: settings)
+    hook.install()
+    hook.install()  # idempotent
+    entries = json.loads(settings.read_text())["hooks"]["UserPromptSubmit"]
+    assert len(entries) == 2 and "code-search hook" in entries[1]["hooks"][0]["command"]
+    hook.uninstall()
+    assert json.loads(settings.read_text())["hooks"]["UserPromptSubmit"] == entries[:1]  # other hooks kept
+
+    indexer.index(repo)
+    try:
+        text = server.auto_context("how is the JWT access token validated", str(repo), min_score=0)
+        assert "src/auth/jwt.py" in text
+        assert server.auto_context("how is the JWT access token validated", str(repo), min_score=1.1) == ""
+    finally:
+        WATCHERS.stop_all()
+
+    monkeypatch.setattr(daemon, "info", lambda timeout=1: {"port": 1, "token": "t"})
+    monkeypatch.setattr(daemon, "_request", lambda st, path, body=None, timeout=0: {"result": "- src/a.py:1-2"})
+    out = io.StringIO()
+    hook.run(io.StringIO(json.dumps({"prompt": "where are JWT tokens validated?", "cwd": str(repo)})), out)
+    assert json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"] == "- src/a.py:1-2"
+    out = io.StringIO()
+    hook.run(io.StringIO(json.dumps({"prompt": "thanks", "cwd": str(repo)})), out)
+    assert out.getvalue() == ""
+
+
+def test_daemon(repo, env, monkeypatch):
+    import signal
+
+    from code_search import config, daemon
+
+    monkeypatch.setenv("CODE_EMBED_DAEMON", "1")
+    monkeypatch.setenv("CODE_EMBED_DAEMON_IDLE_MINUTES", "2")  # a backstop if the kill below never runs
+    config.reload()
+    st = daemon.ensure(wait=90)
+    try:
+        assert st, (config.CFG.cache_dir / "daemon.log").read_text(errors="replace")[-2000:]
+        out = daemon.call("search_code", {"query": "validate_token", "path": str(repo), "k": 1})
+        assert "src/auth/jwt.py" in out
+        out = daemon.call("find_references", {"symbol": "load_key", "path": str(repo)})
+        assert "src/auth/jwt.py" in out
+        assert daemon.ensure()["pid"] == st["pid"]  # reused, not a second daemon
+        with pytest.raises(RuntimeError, match="unknown tool"):
+            daemon.call("nope", {})
+    finally:
+        if daemon.state_path().exists():
+            os.kill(json.loads(daemon.state_path().read_text())["pid"], signal.SIGTERM)
+
+
+def test_query_signals():
+    from code_search.search import query_signals
+
+    idents, files = query_signals("QuerySet.filter() fails in django/db/models/query.py when `parse_header` "
+                                  "gets None; see getUserToken, HTTPServer and the main config")
+    assert idents == {"queryset", "filter", "parse_header", "getusertoken", "httpserver"}
+    assert files == {"django/db/models/query.py"}
+    assert query_signals("where are tokens validated") == (set(), set())

@@ -9,6 +9,9 @@ your machine: code, index and model.
 
 | Tool | What it's for |
 |---|---|
+| `prepare_context` | Start here for a task: the most relevant code in full, what it calls, who uses it, its tests and related commits, packed into a token budget. Every item has a handle for `expand` |
+| `expand` | Full code for a handle: `path:12-40`, `path:12`, `path::Symbol`, a symbol, or a file |
+| `find_definition`, `find_references` | Where a symbol is defined, and every place that uses it (code graph from the tree-sitter index) |
 | `search_code` | Find code by meaning or name. Hybrid vectors + BM25, symbol-aware results, optional reranker, multi-repo |
 | `related_files` | Before editing: files that change with this one (git co-change + callers/callees + similarity) |
 | `find_tests` | Tests covering a file, `file:line` or symbol |
@@ -28,6 +31,10 @@ How it stays fast and fresh:
   so going back to a branch costs no model time.
 - **Never blocks the agent**: a first index of a big repo runs in the background, and tools answer
   from the partial index with a progress note.
+- **One shared model**: the first client starts a background service that loads the model once.
+  Every Codex/Claude window, terminal command and the UI use it, so a second window costs no extra
+  GPU memory or load time. It exits after 30 idle minutes. `CODE_EMBED_DAEMON=0` keeps everything
+  in-process instead.
 - **Safe with several clients at once**: Codex and Claude Code can run it side by side on the same repo.
 - The index lives in `~/.cache/code-embed/`, nothing is written into your repo, and `.gitignore` is respected.
 
@@ -37,10 +44,26 @@ Requires [uv](https://docs.astral.sh/uv/). Put this folder somewhere permanent, 
 
 ```bash
 cd ~/tools/code-search-mcp
-uv sync                                   # installs deps (PyTorch etc.) into .venv
+uv run code-search setup                  # installs everything, with the PyTorch build for your GPU
+uv run code-search ui                     # optional: the web UI (search, repos, GPU, agent setup)
 uv run code-search index ~/code/my-repo   # optional: pre-build; first run downloads the model (~1.5 GB)
 uv run code-search search "where are JWTs validated" --path ~/code/my-repo
 ```
+
+`setup` picks the GPU automatically:
+
+| Hardware | What it does |
+|---|---|
+| NVIDIA (Windows, Linux) | Installs the CUDA build that matches your driver (`uv --torch-backend auto`) |
+| AMD Radeon (Windows, Linux) | Installs AMD's ROCm build for your exact GPU (e.g. gfx1201 for RX 9070 XT); no ROCm SDK needed |
+| Apple Silicon | Installs the standard build, which runs on the Apple GPU (MPS) |
+| Intel Arc | Installs the XPU build |
+| None of these | Installs the CPU build |
+
+`uv run code-search setup --dry-run` shows what it would install. At runtime the server picks the
+best device on its own (a discrete GPU over an integrated one) and logs it, and `index_status`
+reports it. PyTorch is left out of uv's lockfile on purpose, so `uv run` never swaps your GPU build
+for another one. A plain `uv sync` does remove it; if that happens, the server says so: run `setup` again.
 
 The commands below launch the server with `uv run --project ~/tools/code-search-mcp code-search serve`.
 Use absolute paths; in desktop apps also use the full path to `uv` (`which uv`).
@@ -62,7 +85,7 @@ tool_timeout_sec = 300
 default_tools_approval_mode = "writes"   # tools are read-only, so no approval prompts
 
 [mcp_servers.code-search.env]
-# CODE_EMBED_DEVICE = "mps"              # see Configuration
+# CODE_EMBED_DEVICE = "cuda:1"           # see Configuration; normally auto-detected
 ```
 
 ### Claude Code (CLI, IDE, and the Code tab in Claude Desktop)
@@ -114,9 +137,23 @@ Add to `AGENTS.md` (Codex) or `CLAUDE.md` (Claude Code):
 ```markdown
 ## Code search
 Use the code-search MCP tools before grep/find when you don't know where something lives:
-search_code to locate code by meaning, related_files before editing a file, find_tests to find
-covering tests, find_similar before writing a new helper, search_history for "why did this change".
+prepare_context at the start of a task, expand to read a handle in full, search_code to locate code
+by meaning, find_references before changing a signature, related_files before editing a file,
+find_tests to find covering tests, find_similar before writing a new helper, search_history for
+"why did this change".
 ```
+
+### Automatic context on every prompt (Claude Code)
+
+```bash
+uv run code-search hook install                 # ~/.claude/settings.json; --scope project for ./.claude
+uv run code-search hook uninstall
+```
+
+This adds a `UserPromptSubmit` hook. On each prompt it attaches the few code locations that match
+confidently (as `path:lines` handles), so the agent starts in the right place even when it forgets
+to search. It skips short replies and slash commands, adds nothing when no match clears the
+threshold, never waits for a model to load, and gives up after 8 seconds.
 
 ## Configuration
 
@@ -124,17 +161,22 @@ All settings are environment variables. Put them in the `env` block of your clie
 
 | Variable | Default | |
 |---|---|---|
-| `CODE_EMBED_DEVICE` | auto | `cuda`, `mps` (Apple Silicon) or `cpu` |
+| `CODE_EMBED_DEVICE` | auto | Override the detected device: `cuda` / `cuda:1` (NVIDIA and AMD), `mps`, `xpu` or `cpu` |
 | `CODE_EMBED_DIM` | `768` | `512` / `256` / `128`: smaller, faster index (Matryoshka truncation) |
-| `CODE_EMBED_RERANK` | off | Cross-encoder for sharper ranking, e.g. `BAAI/bge-reranker-v2-m3` |
+| `CODE_EMBED_RERANK` | off | Reranker for sharper ranking: `BAAI/bge-reranker-v2-m3`, `Alibaba-NLP/gte-reranker-modernbert-base`, `Qwen/Qwen3-Reranker-0.6B`, or `jinaai/jina-reranker-v3` (non-commercial license; needs `CODE_EMBED_TRUST_REMOTE_CODE=1`) |
+| `CODE_EMBED_RERANK_TOP` | `30` | How many top results the reranker re-scores |
+| `CODE_EMBED_GPU_MEMORY` | `0.5` | Most of the GPU's memory the model may use (fraction); `1` = no cap. Indexing also runs at below-normal CPU priority, so the machine stays usable |
 | `CODE_EMBED_REPOS` | none | Repos to watch from startup and include in `repos: ["all"]` |
 | `CODE_EMBED_IMAGES` | `0` | `1` = also index png/jpg/webp in repos (for `search_by_image`) |
 | `CODE_EMBED_WATCH` | `1` | `0` = no background watcher (refresh on each search instead) |
 | `CODE_EMBED_HISTORY` | `3000` | How many recent commits `search_history` indexes |
 | `CODE_EMBED_MAX_LINES` | `60` | Max lines per chunk |
-| `CODE_EMBED_MODEL` | `google/embeddinggemma-2` | Any sentence-transformers model or a fine-tuned folder |
+| `CODE_EMBED_MODEL` | `google/embeddinggemma-2` | Any sentence-transformers model |
 | `CODE_EMBED_BACKEND` | `st` | `st` (in-process) or `http` (see below) |
 | `CODE_EMBED_CACHE` | `~/.cache/code-embed` | Where indexes live |
+| `CODE_EMBED_DAEMON` | `1` | `0` = load the model in each client process instead of the shared service |
+| `CODE_EMBED_DAEMON_IDLE_MINUTES` | `30` | When the shared service exits after its last request |
+| `CODE_EMBED_HOOK_MIN_SCORE` | `0.5` | How confident a match must be before the prompt hook attaches it |
 
 Changing the model or dimension creates a separate index, so you can compare setups side by side.
 
@@ -158,7 +200,18 @@ CODE_EMBED_HTTP_MODEL=embeddinggemma2
 
 The server sends the model-card prompts itself. Images need the in-process `st` backend.
 
-## Measure, then fine-tune on your repo
+## Benchmark
+
+```bash
+uv run code-search bench --variants hybrid,vector,bm25,context,rerank --out bench.json
+```
+
+Takes real GitHub issues from SWE-bench Lite and SWE-bench Multilingual, checks each repo out at the
+commit before the fix, searches with the issue text and scores whether the files the fix changed
+rank near the top (hit@1/5/10, recall@10, MRR, per language). Repos are fetched shallowly into the
+cache and indexed separately from your own. `--repos` and `--per-repo` set the size.
+
+## Measure on your repo
 
 Build an eval set from your own git history (commit message → files it changed), then measure:
 
@@ -170,29 +223,20 @@ CODE_EMBED_DIM=256 uv run code-search eval eval.jsonl --path ~/code/my-repo   # 
 
 You can also hand-write eval lines: `{"query": "...", "expected": ["path", "path:42", "path::Symbol"]}`.
 
-Fine-tune EmbeddingGemma 2 on pairs mined from the repo (docstring → code, commit message → changed
-functions). This needs a GPU in practice.
-
-```bash
-uv sync --extra finetune
-uv run code-search finetune ./my-repo-embed --path ~/code/my-repo --lora   # prints held-out MRR before/after
-CODE_EMBED_MODEL=$PWD/my-repo-embed uv run code-search eval eval.jsonl --path ~/code/my-repo
-```
-
-Training uses bf16 on capable GPUs and fp32 otherwise. EmbeddingGemma 2 must never run in fp16:
-it silently produces NaN or degraded vectors, and the server refuses NaN embeddings. If the
-fine-tuned model scores better, set `CODE_EMBED_MODEL` to the folder in your client config. A
-`--lora` output is a small adapter on top of the base model.
-
 ## Terminal commands
 
-`code-search index | search | history | related | tests | explain | status | eval | eval-generate | finetune`
+`code-search setup | ui | hook | index | search | context | expand | def | refs | history | related | tests | explain | status | bench | eval | eval-generate`
 (`--help` on each). `code-search serve` runs the MCP server.
+
+`code-search ui` opens a local web app in your browser: search with code previews (Enter opens the
+result in VS Code, Cursor or Zed), history, related files, tests, a repo map, indexed repos with live
+progress, the device in use, and copy-ready agent configs. It listens on 127.0.0.1 only.
 
 ## Development
 
 ```bash
 uv sync --extra dev
+uv run code-search setup                    # PyTorch isn't in the lockfile; only needed for the real model
 CODE_EMBED_BACKEND=hash uv run pytest -q    # offline test backend, no model download
 ```
 

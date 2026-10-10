@@ -1,6 +1,6 @@
 """Embedding backends.
 
-- "st":   sentence-transformers, loads EmbeddingGemma 2 (or any ST model / fine-tuned folder)
+- "st":   sentence-transformers, loads EmbeddingGemma 2 (or any ST model)
 - "http": any OpenAI-compatible /v1/embeddings endpoint: llama-server (GGUF), Ollama, LM Studio
 - "hash": deterministic bag-of-tokens vectors, for tests and offline demos only
 
@@ -20,7 +20,7 @@ from typing import Sequence
 
 import numpy as np
 
-from . import config
+from . import config, hardware
 
 
 def _log(msg: str) -> None:
@@ -96,27 +96,51 @@ class STEmbedder(Embedder):
 
     def __init__(self, cfg):
         super().__init__(cfg)
+        device, self.device_desc = hardware.device(cfg.device)  # first: explains a missing PyTorch
         from sentence_transformers import SentenceTransformer
         import torch
 
-        device = cfg.device
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else (
-                "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+        if device == "cpu" and not cfg.device and (hint := hardware.cpu_fallback_hint()):
+            _log(hint)
+        hardware.be_gentle(device)
         # model card: bf16 or fp32 only; fp16 silently produces NaN / degraded vectors
-        dtype = torch.bfloat16 if device.startswith("cuda") and torch.cuda.is_bf16_supported() else torch.float32
-        _log(f"loading {cfg.model} on {device} ({str(dtype).replace('torch.', '')})")
+        dtype = hardware.dtype(device)
+        _log(f"loading {cfg.model} on {device} [{self.device_desc}] ({str(dtype).replace('torch.', '')})")
         kw = {"truncate_dim": cfg.dim} if cfg.dim < 768 else {}
         self.model = SentenceTransformer(
-            cfg.model, device=device, model_kwargs={"torch_dtype": dtype},
+            cfg.model, device=device, model_kwargs={"dtype": dtype},
             trust_remote_code=os.environ.get("CODE_EMBED_TRUST_REMOTE_CODE") == "1", **kw,
         )
         self._images_ok: bool | None = None
+        # characters per batch: a batch of long chunks needs far more memory than one of short
+        # ones, so batches are sized by length and the budget halves whenever the GPU runs out
+        self._chars = self.cfg.batch * 1500
 
     def _encode(self, texts):
-        # prompt="" stops sentence-transformers adding a default prompt on top of ours
-        return self.model.encode(texts, prompt="", batch_size=self.cfg.batch,
-                                 show_progress_bar=False, convert_to_numpy=True)
+        import torch
+
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]), reverse=True)
+        out: list = [None] * len(texts)
+        i = 0
+        while i < len(order):
+            longest = max(len(texts[order[i]]), 1)
+            idx = order[i:i + max(1, min(self.cfg.batch, self._chars // longest))]
+            try:
+                # prompt="" stops sentence-transformers adding a default prompt on top of ours
+                vecs = self.model.encode([texts[j] for j in idx], prompt="", batch_size=len(idx),
+                                         show_progress_bar=False, convert_to_numpy=True)
+            except (torch.OutOfMemoryError, RuntimeError) as e:
+                if len(idx) == 1 or "out of memory" not in str(e).lower():
+                    raise
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self._chars = max(longest, self._chars // 2)
+                _log(f"out of GPU memory; smaller batches from now on ({self._chars} chars)")
+                continue
+            for j, v in zip(idx, vecs):
+                out[j] = v
+            i += len(idx)
+        return np.stack(out) if out else np.zeros((0, self.cfg.dim), dtype=np.float32)
 
     @property
     def supports_images(self):  # type: ignore[override]
@@ -207,22 +231,95 @@ def get() -> Embedder:
 # ---------------------------------------------------------------- reranker
 
 _rr_lock = threading.Lock()
-_reranker = None
+_rerankers: dict = {}  # name -> loaded model; normally one, the benchmark compares several
+RERANKERS_KEPT = 1
 
 
-def rerank(query: str, docs: Sequence[str]) -> np.ndarray | None:
-    """Score (query, doc) pairs with a cross-encoder if CODE_EMBED_RERANK is set."""
-    global _reranker
-    name = config.CFG.rerank_model
+RERANK_INSTRUCTION = "Given a coding question or issue, judge whether this code is where it is answered or fixed"
+
+
+class _CrossEncoder:
+    """Classic cross-encoders (bge-reranker, gte-reranker, ms-marco ...) via sentence-transformers."""
+
+    def __init__(self, name: str, device: str):
+        from sentence_transformers import CrossEncoder
+
+        self.model = CrossEncoder(name, device=device, model_kwargs={"dtype": hardware.dtype(device)},
+                                  trust_remote_code=os.environ.get("CODE_EMBED_TRUST_REMOTE_CODE") == "1")
+
+    def score(self, query: str, docs: list[str]) -> list[float]:
+        return self.model.predict([(query, d) for d in docs], batch_size=8, show_progress_bar=False).tolist()
+
+
+class _Qwen3:
+    """Qwen3-Reranker: a small LLM asked "does this document answer the query? yes/no"; the score is
+    P(yes). Prompt format from the model card."""
+
+    PREFIX = ("<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the "
+              "Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n")
+    SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    def __init__(self, name: str, device: str):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.device = device
+        self.tok = AutoTokenizer.from_pretrained(name, padding_side="left")
+        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=hardware.dtype(device)).to(device).eval()
+        self.yes, self.no = self.tok.convert_tokens_to_ids("yes"), self.tok.convert_tokens_to_ids("no")
+
+    def score(self, query: str, docs: list[str]) -> list[float]:
+        import torch
+
+        out = []
+        for i in range(0, len(docs), 4):
+            texts = [f"{self.PREFIX}<Instruct>: {RERANK_INSTRUCTION}\n<Query>: {query}\n<Document>: {d}{self.SUFFIX}"
+                     for d in docs[i:i + 4]]
+            enc = self.tok(texts, padding=True, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                # only the last position's logits: the full (tokens x 151k vocab) tensor is gigabytes
+                logits = self.model(**enc, logits_to_keep=1).logits[:, -1, [self.no, self.yes]].float()
+            out += torch.softmax(logits, -1)[:, 1].tolist()
+        return out
+
+
+class _JinaV3:
+    """jina-reranker-v3: listwise, reads the query and all candidates in one pass. Runs Jina's own model
+    code (trust_remote_code) and its weights are CC BY-NC 4.0: non-commercial use only."""
+
+    def __init__(self, name: str, device: str):
+        from transformers import AutoModel
+
+        if os.environ.get("CODE_EMBED_TRUST_REMOTE_CODE") != "1":
+            raise RuntimeError(f"{name} runs its own model code; set CODE_EMBED_TRUST_REMOTE_CODE=1 to allow it")
+        self.model = AutoModel.from_pretrained(name, dtype=hardware.dtype(device), trust_remote_code=True)
+        self.model = self.model.to(device).eval()
+
+    def score(self, query: str, docs: list[str]) -> list[float]:
+        scores = [0.0] * len(docs)
+        for r in self.model.rerank(query, docs):
+            scores[r["index"]] = float(r["relevance_score"])
+        return scores
+
+
+def _load_reranker(name: str):
+    device = hardware.device(config.CFG.device)[0]
+    hardware.be_gentle(device)
+    low = name.lower()
+    cls = _Qwen3 if "qwen3-reranker" in low else _JinaV3 if "jina-reranker-v3" in low else _CrossEncoder
+    _log(f"loading reranker {name} on {device}")
+    return cls(name, device)
+
+
+def rerank(query: str, docs: Sequence[str], model: str | None = None) -> np.ndarray | None:
+    """Relevance of each doc to the query: `model`, or CODE_EMBED_RERANK when not given."""
+    name = config.CFG.rerank_model if model is None else model
     if not name or not docs:
         return None
     with _rr_lock:
-        if _reranker is None or getattr(_reranker, "_cs_name", None) != name:
-            from sentence_transformers import CrossEncoder
-
-            _log(f"loading reranker {name}")
-            _reranker = CrossEncoder(name, device=config.CFG.device,
-                                     trust_remote_code=os.environ.get("CODE_EMBED_TRUST_REMOTE_CODE") == "1")
-            _reranker._cs_name = name
-        scores = _reranker.predict([(query, d[:4000]) for d in docs], show_progress_bar=False)
+        if name not in _rerankers:
+            while len(_rerankers) >= RERANKERS_KEPT:
+                _rerankers.pop(next(iter(_rerankers)))  # free the oldest before loading another
+            _rerankers[name] = _load_reranker(name)
+        # long issue text and long chunks: the start carries the signal, and this bounds memory
+        scores = _rerankers[name].score(query[:2000], [d[:3000] for d in docs])
     return np.asarray(scores, dtype=np.float32)

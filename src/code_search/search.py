@@ -11,6 +11,7 @@ import numpy as np
 
 from . import config, embed, history
 from .embed import tokens
+from .graph import DEF_KINDS
 from .indexer import mean_vector
 from .store import Store
 
@@ -18,13 +19,16 @@ TEST_RE = re.compile(
     r"(^|/)(tests?|__tests__|spec|specs|testing|test_?utils?)/|(^|/)test_[^/]+$|_test\.[^/.]+$|"
     r"\.(test|spec)\.[^/]+$|Tests?\.[^/.]+$|_spec\.rb$|(^|/)conftest\.py$"
 )
-DEF_KINDS = {"function", "method", "class", "interface", "trait", "impl", "struct", "enum", "module",
-             "type", "record", "constructor", "macro", "namespace", "protocol", "test", "block"}
 GENERIC = {"main", "index", "init", "__init__", "utils", "util", "helpers", "common", "test", "tests",
            "config", "types", "constants", "mod", "lib", "app", "self", "this", "new", "get", "set",
            "run", "data", "value", "name", "id", "len", "str", "int", "list", "dict", "map", "string"}
 HISTORY_PREFIX = "task: search result | query: "
 RRF_K = 60
+# code-shaped words in a query: `backticked`, snake_case, camelCase/PascalCase, dotted.names, call()
+_CODE_WORD = re.compile(r"`([^`\n]{2,80})`|(?<![\w.])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|[A-Za-z0-9]*_\w+|"
+                        r"[a-z]+[A-Z]\w*|[A-Z][a-z0-9]+[A-Z]\w*|[A-Z]{2,}[a-z]\w*|[A-Za-z_]\w*(?=\())")
+_FILE_WORD = re.compile(r"[\w./\\-]*\w\.(?:py|pyi|js|jsx|ts|tsx|mjs|go|rs|java|kt|kts|rb|php|c|h|cc|cpp|hpp|cs|"
+                        r"swift|scala|lua|ex|exs|vue|svelte|sh)\b")
 
 
 # ---------------------------------------------------------------- helpers
@@ -34,9 +38,25 @@ def is_test(path: str) -> bool:
     return bool(TEST_RE.search(path))
 
 
-def fts_query(q: str, limit: int = 24) -> str:
+def query_signals(q: str) -> tuple[set[str], set[str]]:
+    """Identifiers and file names the query names explicitly. Issue text and agent prompts quote code
+    (`parse_header`, `QuerySet.filter`, utils/http.py); those words pin the answer far better than
+    the prose around them, so they get their own weight."""
+    q = q or ""
+    files = {f.replace("\\", "/").lstrip("./").lower() for f in _FILE_WORD.findall(q)}
+    idents: set[str] = set()
+    for m in _CODE_WORD.finditer(_FILE_WORD.sub(" ", q)):
+        word = m.group(1) or m.group(2)
+        for part in re.findall(r"[A-Za-z_]\w*", word):
+            if len(part) > 2 and part.lower() not in GENERIC:
+                idents.add(part.lower())
+    return idents, files
+
+
+def fts_query(q: str, limit: int = 24, first: set[str] | None = None) -> str:
+    """OR of the query's tokens; `first` (identifiers) go in before the limit cuts long queries."""
     seen, out = set(), []
-    for t in tokens(q):
+    for t in [*sorted(first or ()), *tokens(q)]:
         if len(t) < 2 or t in seen:
             continue
         seen.add(t)
@@ -99,11 +119,17 @@ def format_hits(hits: list[dict], snippet_lines: int = 25, multi: bool = False) 
 
 def search(stores: list[Store], query: str | None = None, k: int = 8, path_glob: str | None = None,
            kinds: list[str] | None = None, qvec: np.ndarray | None = None,
-           include_tests: bool = True) -> list[dict]:
-    """Hybrid semantic + BM25 search with reciprocal-rank fusion, symbol boost and optional reranking."""
+           include_tests: bool = True, mode: str = "hybrid", rerank_model: str | None = None) -> list[dict]:
+    """Hybrid semantic + BM25 search with reciprocal-rank fusion, symbol boost and optional reranking.
+
+    mode "vector" or "bm25" uses one signal only (for benchmarks); rerank_model overrides CODE_EMBED_RERANK
+    ("" turns reranking off).
+    """
     emb = embed.get()
     qv = qvec if qvec is not None else emb.embed_query(query or "")
-    fq = fts_query(query) if query else ""
+    idents, files = query_signals(query) if query else (set(), set())
+    fq = fts_query(query, first=idents) if query else ""
+    iq = fts_query(" ".join(sorted(idents)), limit=12) if idents else ""
     qtoks = set(tokens(query)) if query else set()
     qlow = (query or "").strip().lower()
     n_sem = max(k * 10, 100)
@@ -120,28 +146,31 @@ def search(stores: list[Store], query: str | None = None, k: int = 8, path_glob:
         n = min(n_sem, len(ids))
         top = np.argpartition(-sims, n - 1)[:n]
         sem_all += [(float(sims[i]), si, int(ids[i])) for i in top]
-        kw = []
+        kw, ikw = [], []
         if fq and st.fts:
             try:
                 with st.connect() as con:
-                    kw = [r[0] for r in con.execute(
-                        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? "
-                        "ORDER BY bm25(chunks_fts, 1.0, 4.0, 0.5) LIMIT 100", (fq,))]
+                    sql = ("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? "
+                           "ORDER BY bm25(chunks_fts, 1.0, 4.0, 0.5) LIMIT 100")
+                    kw = [r[0] for r in con.execute(sql, (fq,))]
+                    if iq:  # a second keyword list over just the named identifiers
+                        ikw = [r[0] for r in con.execute(sql, (iq,))]
             except sqlite3.OperationalError:
-                kw = []
-        per_store.append((ids, sims, kw))
+                kw, ikw = [], []
+        per_store.append((ids, sims, kw, ikw))
 
     sem_all.sort(reverse=True)
-    for r, (s, si, cid) in enumerate(sem_all):
+    for r, (s, si, cid) in enumerate(sem_all if mode != "bm25" else []):
         e = cand.setdefault((si, cid), {"sim": s, "fused": 0.0})
         e["fused"] += 1.0 / (RRF_K + r)
     for si, ps in enumerate(per_store):
         if not ps:
             continue
-        ids, sims, kw = ps
-        for r, cid in enumerate(kw):
-            e = cand.setdefault((si, cid), {"sim": _sim_lookup(ids, sims, cid), "fused": 0.0})
-            e["fused"] += 0.6 / (RRF_K + r)
+        ids, sims, kw, ikw = ps
+        for weight, lst in ((0.6, kw), (0.6, ikw)):
+            for r, cid in enumerate(lst if mode != "vector" else []):
+                e = cand.setdefault((si, cid), {"sim": _sim_lookup(ids, sims, cid), "fused": 0.0})
+                e["fused"] += weight / (RRF_K + r)
     if not cand:
         return []
 
@@ -165,11 +194,17 @@ def search(stores: list[Store], query: str | None = None, k: int = 8, path_glob:
         last = sym.rsplit(".", 1)[-1]
         if sym and (sym == qlow or last == qlow):
             e["fused"] += 2.0 / RRF_K  # exact symbol name typed as the query
+        elif last in idents:
+            e["fused"] += 1.0 / RRF_K  # a definition of an identifier the query names
         elif last and last in qtoks and len(last) > 3:
             e["fused"] += 0.5 / RRF_K
+        path = row["path"].lower()
+        if files and any(path == f or path.endswith("/" + f) for f in files):
+            e["fused"] += 1.0 / RRF_K  # a file the query names
 
     ordered = sorted(cand.items(), key=lambda kv: kv[1]["fused"], reverse=True)
-    rr_n = max(k, config.CFG.rerank_top) if config.CFG.rerank_model and query else k
+    rr_model = config.CFG.rerank_model if rerank_model is None else rerank_model
+    rr_n = max(k, config.CFG.rerank_top) if rr_model and query else k
     picked, spans = [], []
     for (si, cid), e in ordered:
         row = rows.get((si, cid))
@@ -189,15 +224,16 @@ def search(stores: list[Store], query: str | None = None, k: int = 8, path_glob:
         if len(picked) >= rr_n:
             break
 
-    if config.CFG.rerank_model and query and len(picked) > 1:
-        docs = [f"{h['row']['path']} {h['row']['symbol'] or ''}\n{h['row']['text']}" for h in picked]
-        scores = embed.rerank(query, docs)
+    if rr_model and query and len(picked) > 1:
+        # only the top CODE_EMBED_RERANK_TOP are re-scored; anything below keeps its fused order
+        head = picked[:config.CFG.rerank_top]
+        docs = [f"{h['row']['path']} {h['row']['symbol'] or ''}\n{h['row']['text']}" for h in head]
+        scores = embed.rerank(query, docs, model=rr_model)
         if scores is not None:
-            for h, s in zip(picked, scores):
-                h["rerank"] = float(s)
-            picked.sort(key=lambda h: h["rerank"], reverse=True)
-            for h in picked:
-                h["score"] = h["rerank"]
+            for h, s in zip(head, scores):
+                h["rerank"] = h["score"] = float(s)
+            head.sort(key=lambda h: h["rerank"], reverse=True)
+            picked = head + picked[len(head):]
     return picked[:k]
 
 
@@ -502,15 +538,16 @@ def explain_area(store: Store, path_glob: str | None = None, clusters: int | Non
 # ---------------------------------------------------------------- history
 
 
-def search_history(store: Store, query: str, k: int = 8, path: str | None = None) -> str:
+def history_hits(store: Store, query: str, k: int = 8, path: str | None = None) -> tuple[list[dict], str]:
+    """(commits ranked for `query` with their similarity, note when there is nothing to rank)."""
     info = history.update(store.root, store)
     rows = history.commit_rows(store, with_vec=True)
     if not rows:
-        return info.get("note") or "No commit history indexed."
+        return [], info.get("note") or "No commit history indexed."
     if path:
         rows = [r for r in rows if any(f == path or f.startswith(path.rstrip("/") + "/") for f in r["files"])]
         if not rows:
-            return f"No commits touching {path}."
+            return [], f"No commits touching {path}."
     qv = embed.get().embed_query(query, prefix=HISTORY_PREFIX)
     mat = np.stack([r["vec"] for r in rows])
     sims = mat @ qv
@@ -531,11 +568,17 @@ def search_history(store: Store, query: str, k: int = 8, path: str | None = None
             pass
     by_sha = {r["sha"]: (r, float(s)) for r, s in zip(rows, sims)}
     top = sorted(fused, key=fused.get, reverse=True)[:k]
+    return [{**by_sha[sha][0], "score": by_sha[sha][1]} for sha in top], ""
+
+
+def search_history(store: Store, query: str, k: int = 8, path: str | None = None) -> str:
+    hits, note = history_hits(store, query, k, path)
+    if not hits:
+        return note
     out = []
-    for n, sha in enumerate(top, 1):
-        r, s = by_sha[sha]
+    for n, r in enumerate(hits, 1):
         date = time.strftime("%Y-%m-%d", time.localtime(r["ts"]))
-        out.append(f"### {n}. {sha[:10]} · {date} · {r['author']}  (score {s:.3f})\n{r['subject']}")
+        out.append(f"### {n}. {r['sha'][:10]} · {date} · {r['author']}  (score {r['score']:.3f})\n{r['subject']}")
         if r["body"]:
             out.append("> " + r["body"].strip().splitlines()[0][:200])
         if r["symbols"]:

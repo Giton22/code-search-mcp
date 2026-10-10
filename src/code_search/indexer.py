@@ -225,6 +225,7 @@ def index(root: Path, quiet: bool = False, progress: dict | None = None) -> dict
             if head:
                 store.set_meta(con, "head", head.strip())
             store.set_meta(con, "indexed_at", repr(time.time()))
+            store.ensure_graph(con)
             store.prune_cache(con)
             stats["total_chunks"] = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     stats["root"] = str(root)

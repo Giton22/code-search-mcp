@@ -10,7 +10,6 @@ dependencies = [
     "numpy>=1.24",
     "sentence-transformers>=5.0",
     "transformers",
-    "torch",
     "tree-sitter>=0.23",
     "tree-sitter-language-pack>=0.7",
     "watchdog>=4.0",
@@ -18,11 +17,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-finetune = ["datasets", "accelerate", "peft"]
 dev = ["pytest"]
 
 [project.scripts]
 code-search = "code_search.cli:main"
+
+[tool.uv]
+# PyTorch (and torchvision, which EmbeddingGemma 2's processor needs) is installed by
+# `code-search setup` for this machine's GPU: CUDA, ROCm, MPS or CPU. Keeping it out of the
+# lockfile means `uv run` never swaps that build for a CPU one.
+exclude-dependencies = ["torch", "torchvision"]
 
 [build-system]
 requires = ["hatchling"]
