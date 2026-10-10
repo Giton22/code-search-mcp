@@ -278,7 +278,7 @@ def index_status(path: str | None = None, all_repos: bool = False) -> dict | lis
             "indexing_now": bool(job and job[0].is_alive()),
             "model": config.CFG.model_tag, "backend": config.CFG.backend,
             "device": getattr(embed._instance, "device_desc", None),
-            "reranker": config.CFG.rerank_model or None, "db": str(s.path),
+            "reranker": embed.reranker_name() or None, "db": str(s.path),
         })
     return out if all_repos else out[0]
 

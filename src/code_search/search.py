@@ -122,7 +122,7 @@ def search(stores: list[Store], query: str | None = None, k: int = 8, path_glob:
            include_tests: bool = True, mode: str = "hybrid", rerank_model: str | None = None) -> list[dict]:
     """Hybrid semantic + BM25 search with reciprocal-rank fusion, symbol boost and optional reranking.
 
-    mode "vector" or "bm25" uses one signal only (for benchmarks); rerank_model overrides CODE_EMBED_RERANK
+    mode "vector" or "bm25" uses one signal only (for benchmarks); rerank_model overrides the configured reranker
     ("" turns reranking off).
     """
     emb = embed.get()
@@ -203,7 +203,7 @@ def search(stores: list[Store], query: str | None = None, k: int = 8, path_glob:
             e["fused"] += 1.0 / RRF_K  # a file the query names
 
     ordered = sorted(cand.items(), key=lambda kv: kv[1]["fused"], reverse=True)
-    rr_model = config.CFG.rerank_model if rerank_model is None else rerank_model
+    rr_model = embed.reranker_name() if rerank_model is None else rerank_model
     rr_n = max(k, config.CFG.rerank_top) if rr_model and query else k
     picked, spans = [], []
     for (si, cid), e in ordered:
@@ -231,7 +231,7 @@ def search(stores: list[Store], query: str | None = None, k: int = 8, path_glob:
         scores = embed.rerank(query, docs, model=rr_model)
         if scores is not None:
             for h, s in zip(head, scores):
-                h["rerank"] = h["score"] = float(s)
+                h["rerank"] = float(s)  # orders results; "score" stays the similarity, which thresholds use
             head.sort(key=lambda h: h["rerank"], reverse=True)
             picked = head + picked[len(head):]
     return picked[:k]

@@ -163,7 +163,7 @@ All settings are environment variables. Put them in the `env` block of your clie
 |---|---|---|
 | `CODE_EMBED_DEVICE` | auto | Override the detected device: `cuda` / `cuda:1` (NVIDIA and AMD), `mps`, `xpu` or `cpu` |
 | `CODE_EMBED_DIM` | `768` | `512` / `256` / `128`: smaller, faster index (Matryoshka truncation) |
-| `CODE_EMBED_RERANK` | off | Reranker for sharper ranking: `BAAI/bge-reranker-v2-m3`, `Alibaba-NLP/gte-reranker-modernbert-base`, `Qwen/Qwen3-Reranker-0.6B`, or `jinaai/jina-reranker-v3` (non-commercial license; needs `CODE_EMBED_TRUST_REMOTE_CODE=1`) |
+| `CODE_EMBED_RERANK` | `Qwen/Qwen3-Reranker-0.6B` with a GPU, off on CPU | Reranker that re-sorts the top results. `off` disables it. Others: `jinaai/jina-reranker-v3` (ranked best on the benchmark, but non-commercial license and needs `CODE_EMBED_TRUST_REMOTE_CODE=1`), `Alibaba-NLP/gte-reranker-modernbert-base`, `BAAI/bge-reranker-v2-m3` |
 | `CODE_EMBED_RERANK_TOP` | `30` | How many top results the reranker re-scores |
 | `CODE_EMBED_GPU_MEMORY` | `0.5` | Most of the GPU's memory the model may use (fraction); `1` = no cap. Indexing also runs at below-normal CPU priority, so the machine stays usable |
 | `CODE_EMBED_REPOS` | none | Repos to watch from startup and include in `repos: ["all"]` |

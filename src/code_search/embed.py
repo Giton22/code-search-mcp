@@ -310,9 +310,26 @@ def _load_reranker(name: str):
     return cls(name, device)
 
 
+DEFAULT_RERANKER = "Qwen/Qwen3-Reranker-0.6B"  # best permissively licensed one on `code-search bench`
+
+
+def reranker_name() -> str:
+    """CODE_EMBED_RERANK when set ("off" disables it); otherwise Qwen3-Reranker-0.6B when there's a GPU.
+    On CPU it would add seconds to every search, so it stays off there unless asked for."""
+    v = config.CFG.rerank_model.strip()
+    if v.lower() in {"0", "off", "none", "no", "false"}:
+        return ""
+    if v or config.CFG.backend != "st":
+        return v
+    try:
+        return DEFAULT_RERANKER if hardware.device(config.CFG.device)[0] != "cpu" else ""
+    except RuntimeError:  # no PyTorch
+        return ""
+
+
 def rerank(query: str, docs: Sequence[str], model: str | None = None) -> np.ndarray | None:
-    """Relevance of each doc to the query: `model`, or CODE_EMBED_RERANK when not given."""
-    name = config.CFG.rerank_model if model is None else model
+    """Relevance of each doc to the query: `model`, or the configured reranker when not given."""
+    name = reranker_name() if model is None else model
     if not name or not docs:
         return None
     with _rr_lock:

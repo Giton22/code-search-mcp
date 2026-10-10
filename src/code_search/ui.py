@@ -83,7 +83,7 @@ def _system() -> dict:
     return {"gpus": [g["name"] + (f" ({g['gfx']})" if g["gfx"] else "") for g in gpus],
             "device": loaded, "plan": desc, "setup_needed": config.CFG.backend == "st" and (no_torch or unused_gpu),
             "setup_command": "uv run code-search setup", "model": config.CFG.model_tag,
-            "backend": config.CFG.backend, "reranker": config.CFG.rerank_model or None,
+            "backend": config.CFG.backend, "reranker": embed.reranker_name() or None,
             "project": str(PROJECT), "connect": _connect_snippets()}
 
 

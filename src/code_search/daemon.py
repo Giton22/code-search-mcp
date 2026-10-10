@@ -158,7 +158,12 @@ def run(idle_minutes: float | None = None) -> None:
         indexer.log(f"daemon on http://127.0.0.1:{ui.Handler.port}/ (pid {os.getpid()}, idle exit "
                     f"after {idle / 60:.0f} min)")
         if config.CFG.backend == "st":
-            threading.Thread(target=embed.get, daemon=True).start()  # load the model before the first search
+            def preload():  # load the models before the first search needs them
+                embed.get()
+                if embed.reranker_name():
+                    embed.rerank("warm up", ["x"])
+
+            threading.Thread(target=preload, daemon=True).start()
         threading.Thread(target=server.warm_configured_repos, daemon=True).start()
 
         def reaper():
