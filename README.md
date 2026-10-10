@@ -40,7 +40,7 @@ How it stays fast and fresh:
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/). Put this folder somewhere permanent, e.g. `~/tools/code-search-mcp`, then:
+Requires [uv](https://docs.astral.sh/uv/) 0.9.8 or newer (an older one fails with "unknown field `exclude-dependencies`": run `uv self update`, or `brew upgrade uv` if you installed it with Homebrew). Put this folder somewhere permanent, e.g. `~/tools/code-search-mcp`, then:
 
 ```bash
 cd ~/tools/code-search-mcp
