@@ -241,3 +241,8 @@ CODE_EMBED_BACKEND=hash uv run pytest -q    # offline test backend, no model dow
 ```
 
 Works with MCP Python SDK 1.x and 2.x.
+
+## License
+
+Apache 2.0, see [LICENSE](LICENSE). The default models (EmbeddingGemma 2, Qwen3-Reranker) are
+Apache 2.0 too. The optional `jinaai/jina-reranker-v3` reranker is CC BY-NC 4.0 (non-commercial use only).
